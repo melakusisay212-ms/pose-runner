@@ -1,8 +1,15 @@
+import 'dart:async';
+
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'camera_status.dart';
+import 'pose/benchmark.dart';
+import 'pose/fps_meter.dart';
+import 'pose/mlkit_pose_source.dart';
+import 'pose/pose_models.dart';
+import 'pose/skeleton_painter.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -25,68 +32,126 @@ class PoseRunnerApp extends StatelessWidget {
         useMaterial3: true,
         colorSchemeSeed: const Color(0xFFFFC107),
       ),
-      home: const CameraCheckScreen(),
+      home: const PoseSpikeScreen(),
     );
   }
 }
 
-/// Session 1 screen: proves the front camera opens and shows its details.
-/// Session 2 adds the pose skeleton on top of this preview.
-class CameraCheckScreen extends StatefulWidget {
-  const CameraCheckScreen({super.key});
+/// Session 2 screen: the pose go / no-go test. Shows the camera with the
+/// detected skeleton on top, live speed numbers, and a 60 second speed test.
+class PoseSpikeScreen extends StatefulWidget {
+  const PoseSpikeScreen({super.key});
 
   @override
-  State<CameraCheckScreen> createState() => _CameraCheckScreenState();
+  State<PoseSpikeScreen> createState() => _PoseSpikeScreenState();
 }
 
-class _CameraCheckScreenState extends State<CameraCheckScreen>
+class _PoseSpikeScreenState extends State<PoseSpikeScreen>
     with WidgetsBindingObserver {
+  final ValueNotifier<PoseFrame?> _latestFrame = ValueNotifier<PoseFrame?>(null);
+  final FpsMeter _fpsMeter = FpsMeter();
+  final Stopwatch _clock = Stopwatch()..start();
+  final Stopwatch _benchClock = Stopwatch();
+
   CameraController? _controller;
-  CameraDescription? _camera;
+  MlKitPoseSource? _source;
+  StreamSubscription<PoseFrame>? _subscription;
+  Future<void>? _closing;
+  Timer? _uiTimer;
+
   CameraProblem? _problem;
+  String? _errorDetail;
   bool _starting = true;
+
+  // Start with the fastest setup: if it cannot reach the target, the slower
+  // ones will not either.
+  PoseModelKind _model = PoseModelKind.fast;
+  ResolutionPreset _resolution = ResolutionPreset.low;
+
+  double _fps = 0;
+  double _avgInferenceMs = 0;
+  int _frames = 0;
+
+  Benchmark? _benchmark;
+  int _benchmarkSecondsLeft = 0;
+  BenchmarkResult? _result;
+  String _resultLabel = '';
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _start();
+    _uiTimer = Timer.periodic(
+      const Duration(milliseconds: 500),
+      (_) => _refreshStats(),
+    );
+    unawaited(_open());
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _controller?.dispose();
+    _uiTimer?.cancel();
+    unawaited(_subscription?.cancel());
+    unawaited(_shutdown(_source, _controller));
+    _latestFrame.dispose();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // While the permission dialog is open the app goes inactive; the start
+    // While the permission dialog is open the app goes inactive; the open
     // call is still running then, so we only react when it is not.
     if (_starting) return;
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused) {
-      _stop();
+      unawaited(_close());
     } else if (state == AppLifecycleState.resumed && _controller == null) {
-      _start();
+      unawaited(_open());
     }
   }
 
-  Future<void> _stop() async {
-    final controller = _controller;
-    if (controller == null) return;
-    _controller = null;
-    if (mounted) setState(() {});
-    await controller.dispose();
+  static Future<void> _shutdown(
+    MlKitPoseSource? source,
+    CameraController? controller,
+  ) async {
+    await source?.dispose();
+    await controller?.dispose();
   }
 
-  Future<void> _start() async {
+  Future<void> _close() {
+    final pending = _closeNow();
+    _closing = pending;
+    return pending;
+  }
+
+  Future<void> _closeNow() async {
+    _stopBenchmark();
+    await _subscription?.cancel();
+    _subscription = null;
+    final source = _source;
+    final controller = _controller;
+    _source = null;
+    _controller = null;
+    if (mounted) setState(() {});
+    await _shutdown(source, controller);
+  }
+
+  Future<void> _open() async {
+    await _closing;
+    if (!mounted) return;
     setState(() {
       _starting = true;
       _problem = null;
+      _errorDetail = null;
     });
+    _fpsMeter.reset();
+    _frames = 0;
+    _avgInferenceMs = 0;
+    _latestFrame.value = null;
+
     CameraController? controller;
+    MlKitPoseSource? source;
     try {
       final cameras = await availableCameras();
       final camera = pickFrontCamera(cameras);
@@ -101,29 +166,126 @@ class _CameraCheckScreenState extends State<CameraCheckScreen>
       }
       controller = CameraController(
         camera,
-        ResolutionPreset.medium,
+        _resolution,
         enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.yuv420,
+        imageFormatGroup: ImageFormatGroup.nv21,
       );
       await controller.initialize();
       if (!mounted) {
         await controller.dispose();
         return;
       }
+      source = MlKitPoseSource(
+        controller: controller,
+        camera: camera,
+        model: _model,
+      );
+      _subscription = source.frames.listen(_onFrame);
+      await source.start();
+      if (!mounted) {
+        await _subscription?.cancel();
+        _subscription = null;
+        await _shutdown(source, controller);
+        return;
+      }
       setState(() {
-        _camera = camera;
         _controller = controller;
+        _source = source;
         _starting = false;
       });
     } on Object catch (error) {
+      await _subscription?.cancel();
+      _subscription = null;
+      await source?.dispose();
       await controller?.dispose();
       if (mounted) {
         setState(() {
           _problem = classifyCameraError(error);
+          _errorDetail = '$error';
           _starting = false;
         });
       }
     }
+  }
+
+  Future<void> _reopen() async {
+    await _close();
+    await _open();
+  }
+
+  void _changeModel(PoseModelKind kind) {
+    if (kind == _model) return;
+    setState(() => _model = kind);
+    unawaited(_reopen());
+  }
+
+  void _changeResolution(ResolutionPreset preset) {
+    if (preset == _resolution) return;
+    setState(() => _resolution = preset);
+    unawaited(_reopen());
+  }
+
+  void _onFrame(PoseFrame frame) {
+    _latestFrame.value = frame;
+    _fpsMeter.tick(_clock.elapsedMilliseconds);
+    _avgInferenceMs = _frames == 0
+        ? frame.inferenceMs.toDouble()
+        : _avgInferenceMs * 0.9 + frame.inferenceMs * 0.1;
+    _frames++;
+    _benchmark?.addFrame(
+      elapsedMs: _benchClock.elapsedMilliseconds,
+      hasPose: frame.hasPose,
+    );
+  }
+
+  void _refreshStats() {
+    if (!mounted) return;
+    final bench = _benchmark;
+    if (bench != null) {
+      final left = bench.durationSeconds - _benchClock.elapsedMilliseconds ~/ 1000;
+      if (left <= 0) {
+        _finishBenchmark();
+        return;
+      }
+      _benchmarkSecondsLeft = left;
+    }
+    setState(() {
+      _fps = _fpsMeter.fps(_clock.elapsedMilliseconds);
+    });
+  }
+
+  void _startBenchmark() {
+    if (_controller == null) return;
+    final bench = Benchmark();
+    _benchClock
+      ..reset()
+      ..start();
+    setState(() {
+      _benchmark = bench;
+      _benchmarkSecondsLeft = bench.durationSeconds;
+      _result = null;
+    });
+  }
+
+  void _finishBenchmark() {
+    final bench = _benchmark;
+    if (bench == null) return;
+    _benchClock.stop();
+    final modelName = _model == PoseModelKind.fast ? 'Fast' : 'Accurate';
+    setState(() {
+      _result = bench.finish();
+      _resultLabel = '$modelName model, ${_resolution.name} resolution';
+      _benchmark = null;
+    });
+  }
+
+  void _stopBenchmark() {
+    _benchClock.stop();
+    _benchmark = null;
+  }
+
+  void _cancelBenchmark() {
+    setState(_stopBenchmark);
   }
 
   @override
@@ -133,7 +295,7 @@ class _CameraCheckScreenState extends State<CameraCheckScreen>
         child: Column(
           children: <Widget>[
             Expanded(child: _buildPreview()),
-            _buildInfo(),
+            _buildPanel(),
           ],
         ),
       ),
@@ -159,8 +321,19 @@ class _CameraCheckScreenState extends State<CameraCheckScreen>
                 textAlign: TextAlign.center,
                 style: Theme.of(context).textTheme.titleMedium,
               ),
+              if (_errorDetail != null) ...<Widget>[
+                const SizedBox(height: 8),
+                Text(
+                  _errorDetail!,
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
               const SizedBox(height: 24),
-              FilledButton(onPressed: _start, child: const Text('Try again')),
+              FilledButton(
+                onPressed: () => unawaited(_open()),
+                child: const Text('Try again'),
+              ),
             ],
           ),
         ),
@@ -170,40 +343,149 @@ class _CameraCheckScreenState extends State<CameraCheckScreen>
     if (controller == null || !controller.value.isInitialized) {
       return const SizedBox.shrink();
     }
-    return ClipRect(child: Center(child: CameraPreview(controller)));
-  }
-
-  Widget _buildInfo() {
-    final camera = _camera;
-    final controller = _controller;
-    final size = controller?.value.previewSize;
-    final lines = <String>[
-      if (camera != null) 'Camera: ${camera.name}',
-      if (camera != null) 'Lens: ${camera.lensDirection.name}',
-      if (camera != null) 'Sensor orientation: ${camera.sensorOrientation} deg',
-      if (size != null)
-        'Preview size: ${size.width.toInt()} x ${size.height.toInt()}',
-    ];
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(16),
-      color: Colors.black54,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          Text(
-            'Session 1 check',
-            style: Theme.of(context).textTheme.titleMedium,
-          ),
-          const SizedBox(height: 8),
-          if (lines.isEmpty)
-            const Text('No camera running.')
-          else
-            ...lines.map(Text.new),
-          const SizedBox(height: 8),
-          const Text('If you can see yourself above, Session 1 passes.'),
-        ],
+    return Center(
+      child: AspectRatio(
+        aspectRatio: 1 / controller.value.aspectRatio,
+        child: Stack(
+          fit: StackFit.expand,
+          children: <Widget>[
+            CameraPreview(controller),
+            CustomPaint(painter: SkeletonPainter(notifier: _latestFrame)),
+          ],
+        ),
       ),
     );
+  }
+
+  Widget _buildPanel() {
+    final source = _source;
+    final frame = _latestFrame.value;
+    final issue = source?.lastIssue;
+    final result = _result;
+    final bench = _benchmark;
+    final person = frame == null ? '-' : (frame.hasPose ? 'yes' : 'no');
+    final joints = frame == null ? 0 : frame.visibleCount();
+    final controlsLocked = _starting || _controller == null;
+
+    final headline = TextStyle(
+      fontSize: 18,
+      fontWeight: FontWeight.bold,
+      color: _fps >= 15 ? Colors.greenAccent : Colors.orangeAccent,
+    );
+
+    return Container(
+      width: double.infinity,
+      color: Colors.black87,
+      constraints: const BoxConstraints(maxHeight: 300),
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(
+              'FPS ${_fps.toStringAsFixed(1)}  |  '
+              'model ${_avgInferenceMs.toStringAsFixed(0)} ms',
+              style: headline,
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'Person found: $person  |  joints visible: $joints of '
+              '${Joint.values.length}  |  skipped frames: '
+              '${source?.droppedFrames ?? 0}',
+            ),
+            Text('Frame: ${source?.frameInfo ?? '-'}'),
+            if (issue != null)
+              Text(
+                'Issue: $issue',
+                style: const TextStyle(color: Colors.redAccent),
+              ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: <Widget>[
+                SegmentedButton<PoseModelKind>(
+                  segments: const <ButtonSegment<PoseModelKind>>[
+                    ButtonSegment<PoseModelKind>(
+                      value: PoseModelKind.fast,
+                      label: Text('Fast'),
+                    ),
+                    ButtonSegment<PoseModelKind>(
+                      value: PoseModelKind.accurate,
+                      label: Text('Accurate'),
+                    ),
+                  ],
+                  selected: <PoseModelKind>{_model},
+                  onSelectionChanged: controlsLocked
+                      ? null
+                      : (Set<PoseModelKind> s) => _changeModel(s.first),
+                ),
+                SegmentedButton<ResolutionPreset>(
+                  segments: const <ButtonSegment<ResolutionPreset>>[
+                    ButtonSegment<ResolutionPreset>(
+                      value: ResolutionPreset.low,
+                      label: Text('Low res'),
+                    ),
+                    ButtonSegment<ResolutionPreset>(
+                      value: ResolutionPreset.medium,
+                      label: Text('Medium res'),
+                    ),
+                  ],
+                  selected: <ResolutionPreset>{_resolution},
+                  onSelectionChanged: controlsLocked
+                      ? null
+                      : (Set<ResolutionPreset> s) => _changeResolution(s.first),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            FilledButton(
+              onPressed: controlsLocked
+                  ? null
+                  : (bench == null ? _startBenchmark : _cancelBenchmark),
+              child: Text(
+                bench == null
+                    ? 'Start 60 s test'
+                    : 'Stop test ($_benchmarkSecondsLeft s left)',
+              ),
+            ),
+            if (bench == null && result == null)
+              const Padding(
+                padding: EdgeInsets.only(top: 8),
+                child: Text(
+                  'Stand 2 to 3 m away with your whole body in view, '
+                  'then start the test and keep moving.',
+                ),
+              ),
+            if (result != null) ..._buildResult(result),
+          ],
+        ),
+      ),
+    );
+  }
+
+  List<Widget> _buildResult(BenchmarkResult result) {
+    final verdict = result.passed ? 'PASS' : 'FAIL';
+    final percent = (result.poseRate * 100).round();
+    return <Widget>[
+      const SizedBox(height: 8),
+      Text(
+        '$verdict  |  $_resultLabel',
+        style: TextStyle(
+          fontSize: 16,
+          fontWeight: FontWeight.bold,
+          color: result.passed ? Colors.greenAccent : Colors.redAccent,
+        ),
+      ),
+      Text(
+        'Average ${result.averageFps.toStringAsFixed(1)} FPS  |  '
+        'slowest second ${result.minFps} FPS',
+      ),
+      Text('Person found in $percent% of frames'),
+      const Text(
+        'Pass rule (our starting choice): average at least 15 FPS and no '
+        'second below 10 FPS.',
+      ),
+    ];
   }
 }
