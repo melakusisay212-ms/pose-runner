@@ -19,8 +19,10 @@ class MlKitPoseSource implements PoseSource {
     required CameraController controller,
     required CameraDescription camera,
     required PoseModelKind model,
+    void Function(String message)? trace,
   })  : _controller = controller,
         _camera = camera,
+        _trace = trace,
         _detector = PoseDetector(
           options: PoseDetectorOptions(
             mode: PoseDetectionMode.stream,
@@ -28,7 +30,9 @@ class MlKitPoseSource implements PoseSource {
                 ? PoseDetectionModel.base
                 : PoseDetectionModel.accurate,
           ),
-        );
+        ) {
+    _trace?.call('pose: detector object created (${model.name} model)');
+  }
 
   /// Which ML Kit landmark feeds which of our joints.
   static const Map<Joint, PoseLandmarkType> _landmarkFor =
@@ -51,12 +55,15 @@ class MlKitPoseSource implements PoseSource {
   final CameraController _controller;
   final CameraDescription _camera;
   final PoseDetector _detector;
+  final void Function(String message)? _trace;
   final StreamController<PoseFrame> _out =
       StreamController<PoseFrame>.broadcast();
   final Stopwatch _clock = Stopwatch()..start();
 
   bool _running = false;
   bool _busy = false;
+  bool _tracedFirstFrame = false;
+  bool _tracedFirstResult = false;
   int _dropped = 0;
   String? _lastIssue;
   String _frameInfo = '-';
@@ -87,7 +94,9 @@ class MlKitPoseSource implements PoseSource {
   Future<void> start() async {
     if (_running) return;
     _running = true;
+    _trace?.call('pose: starting frame stream');
     await _controller.startImageStream(_onImage);
+    _trace?.call('pose: frame stream started');
   }
 
   @override
@@ -116,6 +125,13 @@ class MlKitPoseSource implements PoseSource {
 
   void _onImage(CameraImage image) {
     if (!_running) return;
+    if (!_tracedFirstFrame) {
+      _tracedFirstFrame = true;
+      _trace?.call(
+        'pose: first camera frame ${image.width} x ${image.height}, '
+        '${image.planes.length} plane(s), format ${image.format.raw}',
+      );
+    }
     if (_busy) {
       _dropped++;
       return;
@@ -130,13 +146,24 @@ class MlKitPoseSource implements PoseSource {
     try {
       final input = _toInputImage(image);
       if (input == null) return;
+      if (!_tracedFirstResult) {
+        _trace?.call('pose: first processImage call (loads the model)');
+      }
       final watch = Stopwatch()..start();
       final poses = await _detector.processImage(input);
       watch.stop();
+      if (!_tracedFirstResult) {
+        _tracedFirstResult = true;
+        _trace?.call(
+          'pose: first result ok, ${poses.length} person(s), '
+          '${watch.elapsedMilliseconds} ms',
+        );
+      }
       if (!_running || _out.isClosed) return;
       _out.add(_toFrame(poses, image, watch.elapsedMilliseconds));
     } on Object catch (error) {
       _lastIssue = 'Detection error: $error';
+      _trace?.call('pose: detection error $error');
     }
   }
 
